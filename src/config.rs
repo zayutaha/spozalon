@@ -1,6 +1,15 @@
 /// Magic bytes identifying spozalon packets
 pub const MAGIC: &[u8; 4] = b"SPOZ";
 
+/// Default UDP port for audio streaming
+pub const DEFAULT_PORT: u16 = 44100;
+
+/// Audio sample rate in Hz
+pub const SAMPLE_RATE: u32 = 48000;
+
+/// Number of audio channels
+pub const CHANNELS: u16 = 2;
+
 /// Disconnect timeout before pausing (ms)
 pub const DISCONNECT_TIMEOUT_MS: u64 = 2000;
 
