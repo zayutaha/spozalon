@@ -12,19 +12,12 @@ pub struct Cli {
 pub enum Command {
     /// Capture system audio and stream it (run on Linux)
     Send {
-        /// UDP port to listen on
         #[arg(long, default_value_t = 44100)]
         port: u16,
-
-        /// Address to bind to
         #[arg(long, default_value = "0.0.0.0")]
         bind: String,
-
-        /// PipeWire/Pulse device to capture from (default: auto-detect monitor)
         #[arg(long)]
         device: Option<String>,
-
-        /// Print connection status to stderr
         #[arg(long)]
         verbose: bool,
     },

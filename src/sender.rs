@@ -4,81 +4,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use crate::capture;
 use crate::config::*;
 use crate::protocol::Packet;
 
 /// Run the sender: capture audio and stream it over UDP.
-pub async fn run(bind: &str, port: u16, device_name: Option<&str>, verbose: bool) -> Result<()> {
+pub async fn run(bind: &str, port: u16, _device_name: Option<&str>, verbose: bool) -> Result<()> {
     let addr = format!("{}:{}", bind, port);
 
-    // --- Find audio capture device ---
-    let host = cpal::default_host();
-    let device = find_capture_device(&host, device_name)?;
-
-    let dev_name = device
-        .description()
-        .map(|d| d.name().to_string())
-        .unwrap_or_else(|_| "unknown".into());
-    if verbose {
-        eprintln!("[sender] Using device: {}", dev_name);
-    }
-
-    let supported_config = device
-        .default_input_config()
-        .context("Failed to get default input config")?;
-
-    if verbose {
-        eprintln!(
-            "[sender] Audio config: {} Hz, {:?}, {:?}",
-            supported_config.sample_rate(),
-            supported_config.channels(),
-            supported_config.sample_format()
-        );
-    }
-
-    let sample_rate = supported_config.sample_rate();
-    let channels = supported_config.channels() as usize;
-    let stream_config = supported_config.config();
-
     // --- Set up audio capture channel ---
-    // Large buffer to avoid dropping packets under bursty cpal callbacks
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(64);
+    let running = Arc::new(AtomicBool::new(true));
 
-    let stream = device.build_input_stream(
-        stream_config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // Convert to stereo f32 immediately, send whatever cpal gives us
-            let samples: Vec<f32> = if channels == 2 {
-                data.to_vec()
-            } else if channels == 1 {
-                data.iter().flat_map(|&s| [s, s]).collect()
-            } else {
-                data.chunks(channels)
-                    .flat_map(|frame| {
-                        let l = frame.get(0).copied().unwrap_or(0.0);
-                        let r = frame.get(1).copied().unwrap_or(0.0);
-                        [l, r]
-                    })
-                    .collect()
-            };
-
-            // Send whatever we got — no fixed chunk size
-            let _ = audio_tx.try_send(samples);
-        },
-        move |err| {
-            eprintln!("[sender] Audio capture error: {}", err);
-        },
-        None,
-    )?;
-
-    stream.play().context("Failed to start audio capture")?;
+    // --- Start PipeWire capture ---
+    let _capture_child = capture::start_capture(audio_tx, running.clone(), verbose)?;
 
     if verbose {
-        eprintln!("[sender] Audio capture started");
+        eprintln!("[sender] Audio capture started (PipeWire)");
     }
 
     // --- Volume polling ---
@@ -103,7 +48,6 @@ pub async fn run(bind: &str, port: u16, device_name: Option<&str>, verbose: bool
         eprintln!("[sender] Listening on {}", addr);
     }
 
-    let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     let verbose_flag = verbose;
 
@@ -191,7 +135,7 @@ pub async fn run(bind: &str, port: u16, device_name: Option<&str>, verbose: bool
                         sequence,
                         timestamp_ns: stream_start.elapsed().as_nanos() as u64,
                         sample_count: (samples.len() / 2) as u32,
-                        sample_rate,
+                        sample_rate: SAMPLE_RATE,
                         volume_percent: vol,
                         pcm_data: samples,
                     };
@@ -223,46 +167,6 @@ pub async fn run(bind: &str, port: u16, device_name: Option<&str>, verbose: bool
     }
 
     Ok(())
-}
-
-/// Find a suitable audio capture device.
-fn find_capture_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Device> {
-    if let Some(name) = name {
-        let devices = host
-            .input_devices()
-            .context("Failed to enumerate input devices")?;
-
-        for device in devices {
-            let matches = device
-                .description()
-                .map(|d| d.name() == name)
-                .unwrap_or(false);
-            if matches {
-                return Ok(device);
-            }
-        }
-
-        anyhow::bail!("Audio device '{}' not found", name);
-    }
-
-    // Auto-detect: find a device with "monitor" in the name
-    let devices = host
-        .input_devices()
-        .context("Failed to enumerate input devices")?;
-
-    for device in devices {
-        let is_monitor = device
-            .description()
-            .map(|d| d.name().to_lowercase().contains("monitor"))
-            .unwrap_or(false);
-        if is_monitor {
-            return Ok(device);
-        }
-    }
-
-    // Fallback: use default input device
-    host.default_input_device()
-        .context("No audio input devices found. Is PipeWire running?")
 }
 
 /// Read system volume via pactl.
