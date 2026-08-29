@@ -115,8 +115,8 @@ pub async fn run(
     stream_config.buffer_size = cpal::BufferSize::Default;
 
     // --- Shared state ---
-    // 500ms buffer = enough to absorb bursts and jitter
-    let buf_frames = _sample_rate as usize; // 500ms buffer at sample rate
+    // ~50ms buffer — enough to absorb jitter without perceptible latency
+    let buf_frames = _sample_rate as usize / 20;
     let buffer = Arc::new(Mutex::new(SampleBuffer::new(buf_frames)));
     let current_volume = Arc::new(AtomicU32::new(100));
     let initialized = Arc::new(AtomicBool::new(false));

@@ -158,7 +158,7 @@ pub async fn run(bind: &str, port: u16, _device_name: Option<&str>, verbose: boo
             }
         }
 
-        // Yield briefly to avoid busy-spinning when no audio is playing
+        // Yield to avoid busy-spinning when no audio is playing
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 

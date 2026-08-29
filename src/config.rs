@@ -20,7 +20,7 @@ pub const HANDSHAKE_RETRY_MS: u64 = 1000;
 pub const RING_BUFFER_CHUNKS: usize = 1;
 
 /// Volume polling interval (ms)
-pub const VOLUME_POLL_MS: u64 = 100;
+pub const VOLUME_POLL_MS: u64 = 1000;
 
 /// Packet header size in bytes (4 magic + 4 seq + 8 ts + 4 samples + 4 rate + 2 vol + 2 reserved)
 pub const HEADER_SIZE: usize = 28;
