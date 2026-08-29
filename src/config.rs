@@ -16,6 +16,9 @@ pub const DISCONNECT_TIMEOUT_MS: u64 = 2000;
 /// Handshake retry interval (ms)
 pub const HANDSHAKE_RETRY_MS: u64 = 1000;
 
+/// Ring buffer size in chunks (~10ms)
+pub const RING_BUFFER_CHUNKS: usize = 1;
+
 /// Volume polling interval (ms)
 pub const VOLUME_POLL_MS: u64 = 100;
 

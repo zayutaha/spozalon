@@ -107,18 +107,12 @@ pub async fn run(
         .default_output_config()
         .context("Failed to get default output config")?;
 
-    if verbose {
-        eprintln!(
-            "[receiver] Audio config: {} Hz, {:?}, {:?}",
-            supported_config.sample_rate(),
-            supported_config.channels(),
-            supported_config.sample_format()
-        );
-    }
-
     let _sample_rate = supported_config.sample_rate();
     let channels = supported_config.channels() as usize;
-    let stream_config = supported_config.config();
+
+    // Use lowest latency config available
+    let mut stream_config = supported_config.config();
+    stream_config.buffer_size = cpal::BufferSize::Default;
 
     // --- Shared state ---
     // 500ms buffer = enough to absorb bursts and jitter
