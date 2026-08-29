@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,37 +10,75 @@ use tokio::time::sleep;
 use crate::config::*;
 use crate::protocol::Packet;
 
-/// Ring buffer for received audio chunks.
-struct RingBuffer {
-    chunks: VecDeque<Vec<f32>>,
-    capacity: usize,
+/// Flat sample buffer — a continuous ring of f32 stereo samples.
+/// Network thread pushes samples, audio callback reads sequentially.
+/// No gaps between chunks — eliminates bursty silence.
+struct SampleBuffer {
+    samples: Vec<f32>,
+    write_pos: usize,
+    read_pos: usize,
+    filled: usize, // how many valid samples between read_pos and write_pos
 }
 
-impl RingBuffer {
-    fn new(capacity: usize) -> Self {
+impl SampleBuffer {
+    /// capacity in stereo samples (each frame = left + right = 2 f32s)
+    fn new(capacity_frames: usize) -> Self {
+        let capacity = capacity_frames * 2;
         Self {
-            chunks: VecDeque::with_capacity(capacity),
-            capacity,
+            samples: vec![0.0; capacity],
+            write_pos: 0,
+            read_pos: 0,
+            filled: 0,
         }
     }
 
-    fn push(&mut self, chunk: Vec<f32>) {
-        if self.chunks.len() >= self.capacity {
-            self.chunks.pop_front();
-        }
-        self.chunks.push_back(chunk);
+    fn capacity(&self) -> usize {
+        self.samples.len()
     }
 
-    fn pop_or_silence(&mut self, frames_needed: usize) -> Vec<f32> {
-        match self.chunks.pop_front() {
-            Some(chunk) => chunk,
-            // Silence: frames_needed stereo frames
-            None => vec![0.0; frames_needed * 2],
+    /// Push stereo interleaved samples [L0, R0, L1, R1, ...]
+    fn push(&mut self, data: &[f32]) {
+        for &s in data {
+            self.samples[self.write_pos] = s;
+            self.write_pos = (self.write_pos + 1) % self.capacity();
+            if self.filled < self.capacity() {
+                self.filled += 1;
+            } else {
+                // Overwrite oldest — advance read_pos
+                self.read_pos = (self.read_pos + 1) % self.capacity();
+            }
         }
     }
 
-    fn len(&self) -> usize {
-        self.chunks.len()
+    /// Read up to `max_frames` stereo frames into `out` (interleaved).
+    /// Returns number of frames actually written.
+    fn read(&mut self, out: &mut [f32], channels: usize) -> usize {
+        let frames_needed = out.len() / channels;
+        let frames_available = self.filled / 2; // stereo frames
+        let frames_to_read = frames_needed.min(frames_available);
+
+        for i in 0..frames_to_read {
+            let left = self.samples[self.read_pos];
+            let right = self.samples[(self.read_pos + 1) % self.capacity()];
+            self.read_pos = (self.read_pos + 2) % self.capacity();
+
+            let frame_idx = i * channels;
+            if frame_idx < out.len() {
+                out[frame_idx] = left;
+            }
+            if frame_idx + 1 < out.len() {
+                out[frame_idx + 1] = right;
+            }
+        }
+        self.filled -= frames_to_read * 2;
+
+        frames_to_read
+    }
+
+    fn clear(&mut self) {
+        self.write_pos = 0;
+        self.read_pos = 0;
+        self.filled = 0;
     }
 }
 
@@ -84,12 +121,14 @@ pub async fn run(
     let stream_config = supported_config.config();
 
     // --- Shared state ---
-    let ring = Arc::new(Mutex::new(RingBuffer::new(RING_BUFFER_CHUNKS)));
+    // 500ms buffer = enough to absorb bursts and jitter
+    let buf_frames = _sample_rate as usize; // 500ms buffer at sample rate
+    let buffer = Arc::new(Mutex::new(SampleBuffer::new(buf_frames)));
     let current_volume = Arc::new(AtomicU32::new(100));
     let initialized = Arc::new(AtomicBool::new(false));
 
     // --- Audio playback stream ---
-    let ring_clone = ring.clone();
+    let buffer_clone = buffer.clone();
     let vol_clone = current_volume.clone();
     let init_clone = initialized.clone();
 
@@ -97,40 +136,21 @@ pub async fn run(
         stream_config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             let vol = vol_clone.load(Ordering::Relaxed) as f32 / 100.0;
-            let _ = init_clone.load(Ordering::Relaxed); // reserved for future drift correction
+            let _ = init_clone.load(Ordering::Relaxed);
 
-            let frames_needed = data.len() / channels;
-            let mut written = 0;
+            let mut buf = buffer_clone.lock().unwrap();
+            let frames_read = buf.read(data, channels);
 
-            {
-                let mut buf = ring_clone.lock().unwrap();
-
-                while written < frames_needed {
-                    if buf.len() == 0 {
-                        // Ring empty — fill rest with silence
-                        for s in data.iter_mut().skip(written * channels) {
-                            *s = 0.0;
-                        }
-                        break;
-                    }
-
-                    let chunk = buf.pop_or_silence(frames_needed - written);
-                    let frames_in_chunk = chunk.len() / 2;
-
-                    for i in 0..frames_in_chunk {
-                        if written >= frames_needed {
-                            break;
-                        }
-                        let frame_idx = written * channels;
-                        if frame_idx < data.len() {
-                            data[frame_idx] = chunk[i * 2] * vol;
-                        }
-                        if frame_idx + 1 < data.len() {
-                            data[frame_idx + 1] = chunk[i * 2 + 1] * vol;
-                        }
-                        written += 1;
-                    }
+            // Apply volume
+            for i in 0..frames_read * channels {
+                if i < data.len() {
+                    data[i] *= vol;
                 }
+            }
+
+            // Fill any remaining frames with silence
+            for s in data.iter_mut().skip(frames_read * channels) {
+                *s = 0.0;
             }
         },
         move |err| {
@@ -168,7 +188,7 @@ pub async fn run(
     let handshake_interval = sleep(Duration::from_millis(HANDSHAKE_RETRY_MS));
     tokio::pin!(handshake_interval);
 
-    let mut buf = [0u8; 65536];
+    let mut net_buf = [0u8; 65536];
 
     loop {
         if !running.load(Ordering::SeqCst) {
@@ -191,10 +211,10 @@ pub async fn run(
                         tokio::time::Instant::now() + Duration::from_millis(HANDSHAKE_RETRY_MS)
                     );
                 }
-                result = socket.recv_from(&mut buf) => {
+                result = socket.recv_from(&mut net_buf) => {
                     match result {
                         Ok((len, _)) => {
-                            if let Some(pkt) = Packet::deserialize(&buf[..len]) {
+                            if let Some(pkt) = Packet::deserialize(&net_buf[..len]) {
                                 connected = true;
                                 current_volume.store(pkt.volume_percent as u32, Ordering::Relaxed);
                                 initialized.store(true, Ordering::Relaxed);
@@ -214,21 +234,21 @@ pub async fn run(
             continue;
         }
 
-        // --- Receive packets ---
+        // --- Receive packets and push directly into flat buffer ---
         match tokio::time::timeout(
             Duration::from_millis(DISCONNECT_TIMEOUT_MS),
-            socket.recv_from(&mut buf),
+            socket.recv_from(&mut net_buf),
         )
         .await
         {
             Ok(Ok((len, _))) => {
-                if let Some(pkt) = Packet::deserialize(&buf[..len]) {
+                if let Some(pkt) = Packet::deserialize(&net_buf[..len]) {
                     if !pkt.is_handshake() {
                         current_volume.store(pkt.volume_percent as u32, Ordering::Relaxed);
 
-                        // Push to ring buffer
-                        let mut ring = ring.lock().unwrap();
-                        ring.push(pkt.pcm_data);
+                        // Push directly into flat sample buffer — no chunk boundaries
+                        let mut buf = buffer.lock().unwrap();
+                        buf.push(&pkt.pcm_data);
                     }
                 }
             }
@@ -243,8 +263,8 @@ pub async fn run(
                 }
                 connected = false;
                 initialized.store(false, Ordering::Relaxed);
-                let mut ring = ring.lock().unwrap();
-                ring.chunks.clear();
+                let mut buf = buffer.lock().unwrap();
+                buf.clear();
             }
         }
     }
