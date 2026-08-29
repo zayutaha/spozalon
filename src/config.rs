@@ -13,9 +13,6 @@ pub const SAMPLE_RATE: u32 = 48000;
 /// Number of audio channels
 pub const CHANNELS: u16 = 2;
 
-/// Samples per packet (40ms at 48kHz)
-pub const CHUNK_SAMPLES: usize = 1920;
-
 /// Disconnect timeout before pausing (ms)
 pub const DISCONNECT_TIMEOUT_MS: u64 = 2000;
 

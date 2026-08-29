@@ -32,10 +32,12 @@ impl RingBuffer {
         self.chunks.push_back(chunk);
     }
 
-    fn pop_or_silence(&mut self, samples_per_chunk: usize) -> Vec<f32> {
-        self.chunks
-            .pop_front()
-            .unwrap_or_else(|| vec![0.0; samples_per_chunk])
+    fn pop_or_silence(&mut self, frames_needed: usize) -> Vec<f32> {
+        match self.chunks.pop_front() {
+            Some(chunk) => chunk,
+            // Silence: frames_needed stereo frames
+            None => vec![0.0; frames_needed * 2],
+        }
     }
 
     fn len(&self) -> usize {
@@ -94,38 +96,40 @@ pub async fn run(
     let stream = device.build_output_stream(
         stream_config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let mut ring = ring_clone.lock().unwrap();
             let vol = vol_clone.load(Ordering::Relaxed) as f32 / 100.0;
             let _ = init_clone.load(Ordering::Relaxed); // reserved for future drift correction
 
             let frames_needed = data.len() / channels;
             let mut written = 0;
 
-            while written < frames_needed {
-                let chunk = ring.pop_or_silence(CHUNK_SAMPLES * 2);
-                let frames_in_chunk = chunk.len() / 2;
+            {
+                let mut buf = ring_clone.lock().unwrap();
 
-                for i in 0..frames_in_chunk {
-                    if written >= frames_needed {
+                while written < frames_needed {
+                    if buf.len() == 0 {
+                        // Ring empty — fill rest with silence
+                        for s in data.iter_mut().skip(written * channels) {
+                            *s = 0.0;
+                        }
                         break;
                     }
-                    let sample = chunk[i * 2]; // left channel
-                    let frame_idx = written * channels;
-                    if channels >= 1 && frame_idx < data.len() {
-                        data[frame_idx] = sample * vol;
-                    }
-                    if channels >= 2 && frame_idx + 1 < data.len() {
-                        data[frame_idx + 1] = chunk[i * 2 + 1] * vol;
-                    }
-                    written += 1;
-                }
 
-                if ring.len() == 0 {
-                    // Fill remaining with silence
-                    for s in data.iter_mut().skip(written * channels) {
-                        *s = 0.0;
+                    let chunk = buf.pop_or_silence(frames_needed - written);
+                    let frames_in_chunk = chunk.len() / 2;
+
+                    for i in 0..frames_in_chunk {
+                        if written >= frames_needed {
+                            break;
+                        }
+                        let frame_idx = written * channels;
+                        if frame_idx < data.len() {
+                            data[frame_idx] = chunk[i * 2] * vol;
+                        }
+                        if frame_idx + 1 < data.len() {
+                            data[frame_idx + 1] = chunk[i * 2 + 1] * vol;
+                        }
+                        written += 1;
                     }
-                    break;
                 }
             }
         },

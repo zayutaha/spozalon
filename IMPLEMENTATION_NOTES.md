@@ -96,3 +96,20 @@ doesn't fit neatly into the spec or plan. Update as you go._
 - PipeWire 1.6.8 installed correctly on Arch
 - cpal correctly enumerates ALSA default device on Linux
 - Ready for testing on real Linux hardware with PipeWire + Thunderbolt network
+
+### Audio Playback Verified (macOS)
+- cpal correctly outputs to MacBook Pro Speakers (48kHz, 2ch, f32)
+- Test: sent 440Hz sine wave via UDP → receiver played it through speakers
+- Confirms the full pipeline works: UDP receive → ring buffer → cpal output
+
+### Connection Model Issue Found During Testing
+- Receiver binds to `0.0.0.0:0` (random port), NOT port 44100
+- Receiver sends handshake TO the sender on port 44100
+- Sender receives handshake, notes receiver's address, streams to it
+- This means the sender must be listening on a KNOWN port (44100)
+- Test script initially failed because it sent to port 44100 but receiver was on a random port
+
+### Client Isolation on WiFi
+- Most home routers have AP/Client isolation enabled by default
+- This prevents WiFi devices from talking to each other
+- Fix: disable in router settings, or use Ethernet, or use Thunderbolt

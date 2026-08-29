@@ -45,18 +45,19 @@ pub async fn run(bind: &str, port: u16, device_name: Option<&str>, verbose: bool
     let stream_config = supported_config.config();
 
     // --- Set up audio capture channel ---
-    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(RING_BUFFER_CHUNKS * 2);
+    // Large buffer to avoid dropping packets under bursty cpal callbacks
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(64);
 
     let stream = device.build_input_stream(
         stream_config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            // Convert to stereo f32 immediately, send whatever cpal gives us
             let samples: Vec<f32> = if channels == 2 {
                 data.to_vec()
             } else if channels == 1 {
                 data.iter().flat_map(|&s| [s, s]).collect()
             } else {
                 data.chunks(channels)
-                    .take(CHUNK_SAMPLES)
                     .flat_map(|frame| {
                         let l = frame.get(0).copied().unwrap_or(0.0);
                         let r = frame.get(1).copied().unwrap_or(0.0);
@@ -65,11 +66,8 @@ pub async fn run(bind: &str, port: u16, device_name: Option<&str>, verbose: bool
                     .collect()
             };
 
-            for frame in samples.chunks(CHUNK_SAMPLES * 2) {
-                if frame.len() == CHUNK_SAMPLES * 2 {
-                    let _ = audio_tx.try_send(frame.to_vec());
-                }
-            }
+            // Send whatever we got — no fixed chunk size
+            let _ = audio_tx.try_send(samples);
         },
         move |err| {
             eprintln!("[sender] Audio capture error: {}", err);
@@ -148,6 +146,10 @@ pub async fn run(bind: &str, port: u16, device_name: Option<&str>, verbose: bool
                         if let Some(pkt) = Packet::deserialize(&buf[..len]) {
                             if pkt.is_handshake() {
                                 receiver_addr = Some(addr);
+                                // Send handshake response so receiver knows we're alive
+                                let resp = Packet::handshake(0);
+                                let resp_bytes = resp.serialize();
+                                let _ = socket.send_to(&resp_bytes, addr).await;
                                 if verbose {
                                     eprintln!("[sender] Receiver connected from {}", addr);
                                 }
@@ -173,41 +175,47 @@ pub async fn run(bind: &str, port: u16, device_name: Option<&str>, verbose: bool
         // --- Phase 2: Stream audio ---
         let addr = receiver_addr.unwrap();
         let vol = volume.load(Ordering::Relaxed);
-        let mut sent_any = false;
 
-        while let Ok(samples) = audio_rx.try_recv() {
-            if !running.load(Ordering::SeqCst) {
-                break;
-            }
-
-            let pkt = Packet {
-                sequence,
-                timestamp_ns: stream_start.elapsed().as_nanos() as u64,
-                sample_count: (samples.len() / 2) as u32,
-                sample_rate,
-                volume_percent: vol,
-                pcm_data: samples,
-            };
-
-            let bytes = pkt.serialize();
-            match socket.send_to(&bytes, addr).await {
-                Ok(_) => {
-                    sequence = sequence.wrapping_add(1);
-                    sent_any = true;
-                }
-                Err(e) => {
-                    if verbose {
-                        eprintln!("[sender] Send error: {}", e);
+        // Drain ALL pending audio and send each chunk immediately
+        loop {
+            match audio_rx.try_recv() {
+                Ok(samples) => {
+                    if !running.load(Ordering::SeqCst) {
+                        break;
                     }
-                    receiver_addr = None;
-                    break;
+                    if samples.is_empty() {
+                        continue;
+                    }
+
+                    let pkt = Packet {
+                        sequence,
+                        timestamp_ns: stream_start.elapsed().as_nanos() as u64,
+                        sample_count: (samples.len() / 2) as u32,
+                        sample_rate,
+                        volume_percent: vol,
+                        pcm_data: samples,
+                    };
+
+                    let bytes = pkt.serialize();
+                    match socket.send_to(&bytes, addr).await {
+                        Ok(_) => {
+                            sequence = sequence.wrapping_add(1);
+                        }
+                        Err(e) => {
+                            if verbose {
+                                eprintln!("[sender] Send error: {}", e);
+                            }
+                            receiver_addr = None;
+                            break;
+                        }
+                    }
                 }
+                Err(_) => break, // Channel empty, done for this tick
             }
         }
 
-        if !sent_any {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Yield briefly to avoid busy-spinning when no audio is playing
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     if verbose {
