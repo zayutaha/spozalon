@@ -27,7 +27,7 @@ pub fn start_capture(
             "--format", "f32",
             "--rate", &SAMPLE_RATE.to_string(),
             "--channels", &CHANNELS.to_string(),
-            "--latency", "5ms",
+            "--latency", "2ms",
             "--target", &monitor_source,
             "-", // output to stdout
         ])
@@ -42,8 +42,8 @@ pub fn start_capture(
     std::thread::Builder::new()
         .name("pw-record-reader".into())
         .spawn(move || {
-            // Read fixed-size chunks: 5ms at 48kHz stereo = 240 samples * 2ch * 4 bytes
-            let chunk_bytes = 240 * CHANNELS as usize * std::mem::size_of::<f32>();
+            // Read fixed-size chunks: 2.5ms at 48kHz stereo = 120 samples * 2ch * 4 bytes
+            let chunk_bytes = 120 * CHANNELS as usize * std::mem::size_of::<f32>();
             let mut reader = stdout;
             let mut buf = vec![0u8; chunk_bytes];
 

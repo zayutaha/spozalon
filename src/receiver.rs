@@ -18,6 +18,7 @@ struct SampleBuffer {
     write_pos: usize,
     read_pos: usize,
     filled: usize, // how many valid samples between read_pos and write_pos
+    target_fill: usize, // adaptive target: how many samples to keep buffered
 }
 
 impl SampleBuffer {
@@ -29,11 +30,26 @@ impl SampleBuffer {
             write_pos: 0,
             read_pos: 0,
             filled: 0,
+            target_fill: capacity / 3, // start at 1/3 capacity
         }
     }
 
     fn capacity(&self) -> usize {
         self.samples.len()
+    }
+
+    /// Report fill level to adaptive controller — call after push or read
+    fn update_target(&mut self) {
+        let cap = self.capacity();
+        let fill_ratio = self.filled as f64 / cap as f64;
+        // If buffer is >70% full, we're lagging behind — shrink target
+        // If buffer is <30% full, we're starving — grow target
+        // Hysteresis prevents oscillation
+        if fill_ratio > 0.7 {
+            self.target_fill = (self.target_fill * 3 / 4).max(cap / 8);
+        } else if fill_ratio < 0.2 && self.target_fill < cap * 2 / 3 {
+            self.target_fill = (self.target_fill * 5 / 4).min(cap * 2 / 3);
+        }
     }
 
     /// Push stereo interleaved samples [L0, R0, L1, R1, ...]
@@ -48,6 +64,7 @@ impl SampleBuffer {
                 self.read_pos = (self.read_pos + 1) % self.capacity();
             }
         }
+        self.update_target();
     }
 
     /// Read up to `max_frames` stereo frames into `out` (interleaved).
@@ -79,6 +96,7 @@ impl SampleBuffer {
         self.write_pos = 0;
         self.read_pos = 0;
         self.filled = 0;
+        self.target_fill = self.capacity() / 6; // restart conservative
     }
 }
 
@@ -115,8 +133,8 @@ pub async fn run(
     stream_config.buffer_size = cpal::BufferSize::Default;
 
     // --- Shared state ---
-    // ~100ms buffer — absorbs WiFi jitter without perceptible latency
-    let buf_frames = _sample_rate as usize / 10;
+    // ~40ms buffer — adaptive, grows on WiFi jitter, shrinks when stable
+    let buf_frames = _sample_rate as usize * 40 / 1000;
     let buffer = Arc::new(Mutex::new(SampleBuffer::new(buf_frames)));
     let current_volume = Arc::new(AtomicU32::new(100));
     let initialized = Arc::new(AtomicBool::new(false));
